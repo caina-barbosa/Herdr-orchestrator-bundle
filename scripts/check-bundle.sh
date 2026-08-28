@@ -49,10 +49,10 @@ assert "name: herdr-orchestrator" in frontmatter
 assert "description:" in frontmatter
 PY
 
-rg -q 'PI_ORCHESTRATOR_PARENT' extensions/orchestrator-idle-handoff.ts
-rg -q 'subagent:result-intercom' extensions/orchestrator-idle-handoff.ts
-rg -q 'event.reason !== "threshold"' optional/auto-resume-after-compaction.ts
-rg -q -- '--prefix is required' skills/herdr-orchestrator/scripts/herdr-watchdog
+grep -q 'PI_ORCHESTRATOR_PARENT' extensions/orchestrator-idle-handoff.ts
+grep -q 'subagent:result-intercom' extensions/orchestrator-idle-handoff.ts
+grep -q 'event.reason !== "threshold"' optional/auto-resume-after-compaction.ts
+grep -q -- '--prefix is required' skills/herdr-orchestrator/scripts/herdr-watchdog
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck skills/herdr-orchestrator/scripts/herdr-watchdog scripts/install.sh
