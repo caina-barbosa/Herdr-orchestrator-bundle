@@ -84,8 +84,6 @@ Run `scripts/check-bundle.sh` before relying on the pack on a new platform.
 
 ## Install
 
-Because this repository starts private, the recipient must first be added as a GitHub collaborator and authenticate GitHub CLI or SSH.
-
 ### 1. Install Herdr
 
 Linux and macOS:
