@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# herdr-watchdog — alert main when a spawned child stalls or vanishes unexpectedly.
+#
+# Watch mode:
+#   herdr-watchdog <main-target> --prefix P [--interval S] [--threshold S]
+#     Watches every Pi agent whose name starts with P (main excluded).
+#     Children are discovered automatically each poll; no roster, no restarts.
+#     Alerts (desktop notification + WATCHDOG: prompt into main) when a child
+#     stays non-working past the threshold (re-arms if it resumes), or when a
+#     child disappears without an acknowledged close. Stall alerts include the
+#     last events from the child's Pi session log so main can diagnose without
+#     a round-trip. Runs until its pane is closed.
+#
+# Close mode:
+#   herdr-watchdog close <child-name>
+#     Acknowledges the close (so watch mode stays silent) and closes the pane.
+set -u
+
+ACK_DIR=/tmp/herdr-watchdog-acks
+SESSIONS_DIR="$HOME/.pi/agent/sessions"
+mkdir -p "$ACK_DIR"
+
+if [ "${1:-}" = close ]; then
+  name=${2:?usage: herdr-watchdog close <child-name>}
+  pane=$(herdr agent list 2>/dev/null | jq -r --arg n "$name" \
+    '.result.agents[] | select(.name==$n) | .pane_id' | head -1)
+  [ -n "$pane" ] || { echo "no live agent named $name" >&2; exit 1; }
+  touch "$ACK_DIR/$name"
+  herdr pane close "$pane"
+  exit
+fi
+
+main_target=${1:?usage: herdr-watchdog <main-target> --prefix P}; shift
+interval=60 threshold=180 prefix=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --prefix)    prefix=$2;    shift 2 ;;
+    --interval)  interval=$2;  shift 2 ;;
+    --threshold) threshold=$2; shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$prefix" ] || { echo "--prefix is required" >&2; exit 2; }
+
+alert() { # $1 headline, $2 optional detail block (prompt only)
+  herdr notification show "herdr-watchdog" --body "$1" --sound request >/dev/null 2>&1
+  herdr agent prompt "$main_target" "WATCHDOG: $1${2:+
+$2}" >/dev/null 2>&1 || true
+  echo "$(date +%T) ALERT: $1"
+}
+
+screen_hash() { herdr agent read "$1" --source visible --lines 15 2>/dev/null | md5sum | cut -c1-12; }
+
+# Pi mangles a session cwd into a directory name: / -> -, then wrap as -<...>--
+session_dir_for_cwd() { # $1 cwd
+  echo "$SESSIONS_DIR/-$(echo "$1" | tr / -)--"
+}
+
+# Newest session file whose header session_info.name matches the child name.
+session_file_for() { # $1 name, $2 cwd
+  local dir f
+  dir=$(session_dir_for_cwd "$2")
+  [ -d "$dir" ] || return 1
+  for f in $(ls -t "$dir"/*.jsonl 2>/dev/null); do
+    if [ "$(head -3 "$f" | jq -r 'select(.type=="session_info") | .name // empty' 2>/dev/null)" = "$1" ]; then
+      echo "$f"; return 0
+    fi
+  done
+  return 1
+}
+
+# Local HH:MM for an ISO timestamp (falls back to raw slice on parse failure).
+local_hm() { # $1 iso-ts
+  date -d "$1" +%H:%M 2>/dev/null || echo "${1:11:5}"
+}
+
+# Render the last 3 session-log entries verbatim-ish (one line each, ~100 chars)
+# plus a staleness line. No filtering, no interpretation: the LLM reads it.
+session_tail() { # $1 file
+  local raw ts rest
+  raw=$(jq -r '
+    def txt: if type=="string" then . else (map(select(.type=="text") | .text) | join(" ")) end;
+    def clip: gsub("\n"; " ") | .[0:100];
+    def line:
+      (.timestamp // "?" | tostring) as $t |
+      if .type=="message" then
+        if .message.role=="user" then "\($t)\tuser: \(.message.content | txt | clip)"
+        elif .message.role=="toolResult" then "\($t)\ttoolResult\(if .message.isError then " (ERROR)" else "" end): \(.message.content | txt | clip)"
+        elif .message.role=="assistant" then
+          if .message.stopReason=="toolUse" then "\($t)\ttoolcall \(.message.content | map(select(.type=="toolCall")) | .[0] | "\(.name) \(.arguments | tostring)" | clip)"
+          elif .message.stopReason=="error" then "\($t)\tassistant ERROR: \(.message.errorMessage // .errorMessage // "?" | clip)"
+          else "\($t)\tassistant (\(.message.stopReason // "?")): \(.message.content | txt | clip)"
+          end
+        else "\($t)\t\(.message.role)"
+        end
+      elif .type=="compaction" then "\($t)\tcompaction (tokensBefore \(.tokensBefore // "?"))"
+      elif .type=="session_info" then "\($t)\tsession started (name: \(.name // "?"))"
+      elif .type=="session" then "\($t)\tsession file created (cwd: \(.cwd // "?"))"
+      else "\($t)\t\(.type)\(if .model then " -> \(.model | tostring)" else "" end)"
+      end;
+    line
+  ' "$1" 2>/dev/null | tail -3)
+  while IFS=$'\t' read -r ts rest; do
+    [ -n "$rest" ] || continue
+    echo "$(local_hm "$ts") $rest"
+  done <<<"$raw"
+  local last_ts age
+  last_ts=$(tail -1 "$1" | jq -r '.timestamp // empty' 2>/dev/null)
+  if [ -n "$last_ts" ]; then
+    age=$(( ($(date +%s) - $(date -d "$last_ts" +%s 2>/dev/null || date +%s)) / 60 ))
+    echo "-> nothing since (${age}m)"
+  fi
+}
+
+declare -A last_working alerted last_hash
+echo "watching prefix '$prefix' (interval ${interval}s, threshold ${threshold}s)"
+
+while :; do
+  now=$(date +%s)
+  live=$(herdr agent list 2>/dev/null | jq -r --arg p "$prefix" --arg m "$main_target" \
+    '.result.agents[] | select((.name // "") | startswith($p))
+     | select(.name != $m and .pane_id != $m)
+     | "\(.name)\t\(.agent_status)\t\(.pane_id)\t\(.cwd)"') || { sleep "$interval"; continue; }
+
+  # currently-live names, for disappearance detection
+  declare -A seen=()
+  while IFS=$'\t' read -r name status pane cwd; do
+    [ -n "$name" ] || continue
+    seen[$name]=1
+    rm -f "$ACK_DIR/$name"   # alive again: consume any stale ack
+    if [ -z "${last_working[$name]:-}" ]; then
+      last_working[$name]=$now; alerted[$name]=0   # first sight: grace starts
+      last_hash[$name]=$(screen_hash "$name")
+      echo "$(date +%T) tracking $name"
+      continue
+    fi
+    hash=$(screen_hash "$name")
+    # a changing screen means the agent is streaming/thinking even when Herdr
+    # misreports Pi as idle; treat status=working OR screen movement as alive
+    if [ "$status" = working ] || [ "$hash" != "${last_hash[$name]}" ]; then
+      last_working[$name]=$now; alerted[$name]=0
+    elif [ $((now - last_working[$name])) -ge "$threshold" ] && [ "${alerted[$name]}" = 0 ]; then
+      detail=""
+      if sf=$(session_file_for "$name" "$cwd"); then
+        detail=$(session_tail "$sf")
+      fi
+      detail="${detail:+$detail
+}pane $pane · cwd $cwd"
+      alert "child $name stalled for $((now - last_working[$name]))s (status: $status, screen frozen)" "$detail"
+      alerted[$name]=1
+    fi
+    last_hash[$name]=$hash
+  done <<<"$live"
+
+  for name in "${!last_working[@]}"; do
+    if [ -z "${seen[$name]:-}" ]; then
+      if [ -e "$ACK_DIR/$name" ]; then
+        rm -f "$ACK_DIR/$name"
+        echo "$(date +%T) $name closed (acknowledged)"
+      else
+        alert "child $name disappeared without acknowledged close (crash or unmanaged close)"
+      fi
+      unset "last_working[$name]" "alerted[$name]" "last_hash[$name]"
+    fi
+  done
+
+  sleep "$interval"
+done
